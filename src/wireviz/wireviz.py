@@ -209,6 +209,10 @@ def parse(
         expected_type = alternating_types[1 - alternating_types.index(expected_type)]
 
     for connection_set in connection_sets:
+        # a connection set may be given as a dict with a `direction` attribute
+        if isinstance(connection_set, dict):
+            connection_set = parse_directed_connection_set(connection_set)
+
         # figure out number of parallel connections within this set
         connectioncount = []
         for entry in connection_set:
@@ -400,6 +404,44 @@ def parse(
                 returns.append(harness)
 
         return tuple(returns) if len(returns) != 1 else returns[0]
+
+
+def flip_arrow(arrow: str) -> str:
+    """Return the arrow pointing the other way, e.g. `-->` becomes `<--`."""
+    return arrow[::-1].translate(str.maketrans("<>", "><"))
+
+
+def parse_directed_connection_set(connection_set: dict) -> list:
+    """
+    Convert a connection set given as a dict into a plain connection set (list).
+
+    Supported keys:
+      path:      the connection set itself, written in signal order
+      direction: 'ltr' (default) draws the path left to right,
+                 'rtl' draws it right to left, e.g. to fold a long chain
+                 back underneath itself instead of extending it further.
+    """
+    unknown = set(connection_set) - {"path", "direction"}
+    if unknown:
+        raise Exception(f"Unknown connection set attribute(s): {', '.join(unknown)}")
+    if "path" not in connection_set or not isinstance(connection_set["path"], list):
+        raise Exception("A connection set given as a dict requires a `path` list")
+    path = connection_set["path"]
+    direction = connection_set.get("direction", "ltr")
+    if direction == "ltr":
+        return path
+    if direction != "rtl":
+        raise Exception(f"Unknown connection set direction: {direction} (use ltr or rtl)")
+
+    # Drawn from right to left: reverse the path, and flip arrows accordingly.
+    reversed_path = []
+    for entry in path[::-1]:
+        if isinstance(entry, str) and is_arrow(entry):
+            entry = flip_arrow(entry)
+        elif isinstance(entry, list):
+            entry = [flip_arrow(e) if isinstance(e, str) and is_arrow(e) else e for e in entry]
+        reversed_path.append(entry)
+    return reversed_path
 
 
 def _get_yaml_data_and_path(inp: Union[str, Path, Dict]) -> (Dict, Path):

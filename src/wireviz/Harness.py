@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -7,7 +8,7 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import Any, List, Union
 
-from graphviz import Graph
+from graphviz import Graph, Source
 from wireviz import APP_NAME, APP_URL, __version__, wv_colors
 from wireviz.DataClasses import (
     Cable,
@@ -63,6 +64,246 @@ def check_old(node: str, old_attr: dict, args: dict) -> None:
     for attr, descr in old_attr.items():
         if attr in args:
             raise ValueError(f"'{attr}' in {node}: '{attr}' {descr}")
+
+
+def smooth_edges(layout: str, width: float = 2.0) -> str:
+    """
+    Redraw the edges of a laid-out dot source (`-Tdot` output) as smooth curves
+    with horizontal tangents at both ends, like wires leaving connector pins.
+
+    Each edge becomes one cubic Bezier S-curve from its start to its end point.
+    If that curve would cross a node, the route found by dot is kept, but
+    smoothed: a Catmull-Rom curve through its on-curve points.
+    """
+    # node bounding boxes (points), from height/pos/width in inches
+    boxes = []
+    for m in re.finditer(
+        r'height=([\d.]+),.*?pos="([\d.-]+),([\d.-]+)",.*?width=([\d.]+)',
+        layout,
+        re.S,
+    ):
+        h, x, y, w = (float(v) for v in m.groups())
+        h, w = h * 72, w * 72
+        boxes.append((x - w / 2, y - h / 2, x + w / 2, y + h / 2))
+
+    def inside(px, py, box, margin=0.0):
+        x0, y0, x1, y1 = box
+        return x0 - margin < px < x1 + margin and y0 - margin < py < y1 + margin
+
+    def bezier(p0, p1, p2, p3, n=40):
+        for i in range(n + 1):
+            t = i / n
+            u = 1 - t
+            yield (
+                u**3 * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t**3 * p3[0],
+                u**3 * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t**3 * p3[1],
+            )
+
+    CLEARANCE = 14  # minimum distance between a wire and other nodes (points)
+
+    def obstacles(start, end):
+        # all nodes except the ones the edge starts and ends at
+        return [b for b in boxes if not (inside(*start, b, 2) or inside(*end, b, 2))]
+
+    def collides(segments, others, margin=CLEARANCE):
+        return any(
+            inside(px, py, b, margin)
+            for seg in segments
+            for px, py in bezier(*seg)
+            for b in others
+        )
+
+    def line_clear(p, q, others, margin):
+        n = max(int(math.hypot(q[0] - p[0], q[1] - p[1]) / 4), 1)
+        return not any(
+            inside(p[0] + (q[0] - p[0]) * i / n, p[1] + (q[1] - p[1]) * i / n, b, margin)
+            for i in range(n + 1)
+            for b in others
+        )
+
+    def plan(start, end, others):
+        """
+        Shortest left-to-right path from start to end through the corners of
+        the obstacles, inflated so the path keeps its distance from them.
+        Returns the waypoints (without start and end), or None.
+        """
+        sign = 1 if end[0] >= start[0] else -1
+        lead_out = (start[0] + sign * 15, start[1])  # leave the pin horizontally
+        lead_in = (end[0] - sign * 15, end[1])
+        pad = CLEARANCE + 6
+        corners = [
+            (x, y)
+            for x0, y0, x1, y1 in others
+            for x in (x0 - pad, x1 + pad)
+            for y in (y0 - pad, y1 + pad)
+            if sign * (x - lead_out[0]) > 0 and sign * (lead_in[0] - x) > 0
+            and not any(inside(x, y, b, CLEARANCE) for b in others)
+        ]
+        nodes = sorted([lead_out] + corners, key=lambda p: sign * p[0]) + [lead_in]
+        cost = {0: 0.0}
+        prev = {}
+        for j in range(1, len(nodes)):
+            for i in range(j):
+                if i not in cost or sign * (nodes[j][0] - nodes[i][0]) <= 1:
+                    continue
+                c = cost[i] + math.hypot(
+                    nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1]
+                )
+                if c < cost.get(j, math.inf) and line_clear(
+                    nodes[i], nodes[j], others, CLEARANCE
+                ):
+                    cost[j], prev[j] = c, i
+        last = len(nodes) - 1
+        if last not in cost:
+            return None
+        path, k = [], last
+        while k != 0:
+            path.append(nodes[k])
+            k = prev[k]
+        return [nodes[0]] + path[::-1]
+
+    def s_curve(p0, p3):
+        d = max(abs(p3[0] - p0[0]) / 2, 20)
+        sign = 1 if p3[0] >= p0[0] else -1  # edges normally run left to right
+        return [(p0, (p0[0] + sign * d, p0[1]), (p3[0] - sign * d, p3[1]), p3)]
+
+    def through(points, soft=False):
+        # Curve through points that is monotone in x (no overshoot or hooks):
+        # Hermite segments with Fritsch-Butland slopes, horizontal at the ends.
+        n = len(points)
+        secants = [
+            (y1 - y0) / (x1 - x0)
+            for (x0, y0), (x1, y1) in zip(points, points[1:])
+        ]
+        slopes = [0.0] * n
+        for i in range(1, n - 1):
+            d0, d1 = secants[i - 1], secants[i]
+            if soft:  # Catmull-Rom like: smoother, but may overshoot a little
+                slopes[i] = (d0 + d1) / 2
+            elif d0 * d1 > 0:
+                slopes[i] = 2 / (1 / d0 + 1 / d1)
+        segments = []
+        for i in range(n - 1):
+            (x0, y0), (x3, y3) = points[i], points[i + 1]
+            h = (x3 - x0) / 3
+            segments.append(
+                ((x0, y0), (x0 + h, y0 + slopes[i] * h), (x3 - h, y3 - slopes[i + 1] * h), (x3, y3))
+            )
+        return segments
+
+    def smooth(match: re.Match) -> str:
+        tokens = match[1].replace("\\\n", "").split()
+        arrows = [t for t in tokens if t.startswith(("s,", "e,"))]
+        points = [tuple(map(float, t.split(","))) for t in tokens if t not in arrows]
+        if len(points) < 4:
+            return match[0]  # not an edge spline
+        start, end = points[0], points[-1]
+        others = obstacles(start, end)
+        segments = s_curve(start, end)
+        if collides(segments, others):
+            waypoints = plan(start, end, others)
+            if waypoints is None:  # no clear path, follow dot's route
+                waypoints = [p for p in points[3:-1:3]]
+
+            def route(inner):
+                pts = [start] + inner + [end]
+                for soft in (True, False):
+                    curve = through(pts, soft=soft)
+                    if not collides(curve, others):
+                        return curve
+                return None
+
+            # densify until the smoothed curve keeps its distance
+            for _ in range(3):
+                if route(waypoints) is not None:
+                    break
+                pts = [start] + waypoints + [end]
+                denser = []
+                for p, q in zip(pts, pts[1:]):
+                    denser += [p, ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2)]
+                waypoints = denser[1:]
+            # then drop every waypoint that is not needed
+            i = 0
+            while i < len(waypoints):
+                fewer = waypoints[:i] + waypoints[i + 1 :]
+                if route(fewer) is not None:
+                    waypoints = fewer
+                else:
+                    i += 1
+            segments = route(waypoints) or through([start] + waypoints + [end])
+        return arrows, segments
+
+    def fmt(points):
+        return " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+
+    def polyline(segments):
+        # sampling of the curve (about every 6 points), so stripes can be
+        # offset; at most ~250 samples, as Graphviz limits strings to 16 kB
+        lengths = [math.hypot(seg[3][0] - seg[0][0], seg[3][1] - seg[0][1]) for seg in segments]
+        step = max(6, sum(lengths) / 250)
+        pts = [segments[0][0]]
+        for seg, length in zip(segments, lengths):
+            n = max(int(length / step), 4)
+            pts.extend(list(bezier(*seg, n=n))[1:])
+        return pts
+
+    def offset(pts, dist):
+        out = []
+        for i, (x, y) in enumerate(pts):
+            (xa, ya), (xb, yb) = pts[max(i - 1, 0)], pts[min(i + 1, len(pts) - 1)]
+            dx, dy = xb - xa, yb - ya
+            norm = (dx * dx + dy * dy) ** 0.5 or 1
+            out.append((x - dy / norm * dist, y + dx / norm * dist))
+        return out
+
+    def as_bezier(pts):
+        # smooth curve through the sampled points (Catmull-Rom as cubic Bezier)
+        flat = [pts[0]]
+        for i in range(len(pts) - 1):
+            p0, p1 = pts[max(i - 1, 0)], pts[i]
+            p2, p3 = pts[i + 1], pts[min(i + 2, len(pts) - 1)]
+            flat += [
+                (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6),
+                (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6),
+                p2,
+            ]
+        return flat
+
+    def edge(match: re.Match) -> str:
+        head, attrs = match[1], match[2]
+        pos = re.search(r'pos="([^"]*)"', attrs)
+        if not pos:
+            return match[0]
+        result = smooth(pos)
+        if isinstance(result, str):
+            return match[0]
+        arrows, segments = result
+        color = re.search(r'color="([^"]*)"', attrs)
+        # edges with the default color carry no color attribute of their own
+        colors = (color[1] if color else default_color).split(":")
+        if len(colors) < 2:  # single line, e.g. dashed mate
+            flat = [segments[0][0]] + [p for seg in segments for p in seg[1:]]
+            new_pos = 'pos="' + " ".join(arrows + [fmt(flat)]) + '"'
+            return match[0].replace(pos[0], new_pos)
+        # Multi-colored wire: one edge per stripe, offset perpendicular to the
+        # curve so the wire keeps a constant diameter, also in steep sections.
+        pts = polyline(segments)
+        stripes = []
+        for i, c in enumerate(colors):
+            dist = (i - (len(colors) - 1) / 2) * width
+            stripe_attrs = attrs.replace(pos[0], f'pos="{fmt(as_bezier(offset(pts, dist)))}"')
+            stripe_attrs = re.sub(r'color="[^"]*",?\s*', "", stripe_attrs)
+            stripe_attrs = re.sub(r"style=bold,?\s*", "", stripe_attrs)
+            stripe_attrs = (
+                f'color="{c}", penwidth={width * 1.15:.2f}, style=solid, '
+                + stripe_attrs
+            )
+            stripes.append(f"{head}\t[{stripe_attrs}];")
+        return "\n".join(stripes)
+
+    default = re.search(r'(?m)^\tedge \[[^\]]*?color="([^"]*)"', layout)
+    default_color = default[1] if default else "#000000"
+    return re.sub(r"(?ms)^(\t[^\n\[]*?--[^\n\[]*?)\s*\[(.*?)\];$", edge, layout)
 
 
 @dataclass
@@ -168,9 +409,9 @@ class Harness:
         dot.attr(
             "graph",
             rankdir="LR",
-            ranksep="2",
+            ranksep=str(self.options.ranksep),
             bgcolor=wv_colors.translate_color(self.options.bgcolor, "HEX"),
-            nodesep="0.33",
+            nodesep=str(self.options.nodesep),
             fontname=self.options.fontname,
         )  # TODO: Add graph attribute: charset="utf-8",
         dot.attr(
@@ -184,8 +425,76 @@ class Harness:
             fontname=self.options.fontname,
         )
         dot.attr("edge", style="bold", fontname=self.options.fontname)
+        if self.options.wire_width != 2:
+            dot.attr("edge", penwidth=str(self.options.wire_width))
+        bar = max(round(self.options.wire_width), 1)  # wire bar height in cables
+
+        # Connectors with `attach: true` are drawn inside the pin row of the
+        # connector they are mated with. attachments[(host, pinindex, side)]
+        # lists the attached connectors; attached_ports maps each attached
+        # connector to the port (in the host) that replaces its own node.
+        attachments = {}
+        attached_ports = {}
+        for mate in self.mates:
+            if not isinstance(mate, MatePin):
+                continue
+            for name, host, host_pin, side in (
+                (mate.from_name, mate.to_name, mate.to_pin, "l"),
+                (mate.to_name, mate.from_name, mate.from_pin, "r"),
+            ):
+                if not self.connectors[name].attach:
+                    continue
+                host_connector = self.connectors[host]
+                if host_connector.attach or host_connector.style == "simple":
+                    raise Exception(
+                        f"{name} can only be attached to a pin of a connector that is not simple"
+                    )
+                if name in attached_ports:
+                    raise Exception(f"{name} is attached to more than one pin")
+                pinindex = host_connector.pins.index(host_pin)
+                attached = attachments.setdefault((host, pinindex, side), [])
+                attached_ports[name] = f"{host}:p{pinindex+1}{side}a{len(attached)}"
+                attached.append(name)
+        for name, connector in self.connectors.items():
+            if connector.attach and name not in attached_ports:
+                raise Exception(f"{name} has attach set, but is not mated with any pin")
+
+        def attachment_cell(host: str, pinindex: int, side: str) -> str:
+            """HTML cell holding the connectors attached to one side of a pin."""
+            attached = attachments.get((host, pinindex, side), [])
+            if not attached:
+                return '<td border="0"></td>'
+            # short dashed line between attachment and pin, like a mate arrow
+            dash = '<td border="0" width="3" height="1" fixedsize="true" bgcolor="#000000"></td>'
+            gap = '<td border="0" width="2" height="1" fixedsize="true"></td>'
+            dashes = dash + gap + dash + gap + dash
+            line = (
+                '<td border="0" cellpadding="0" valign="middle">'
+                f'<table border="0" cellspacing="0" cellpadding="0"><tr>{dashes}</tr></table>'
+                "</td>"
+            )
+            rows = []
+            for k, name in enumerate(attached):
+                box = (
+                    f'<td border="1" cellpadding="3" port="p{pinindex+1}{side}a{k}">'
+                    f"{html_line_breaks(self.connectors[name].type) or name}</td>"
+                )
+                rows.append(f"<tr>{box + line if side == 'l' else line + box}</tr>")
+            spacer = '<tr><td colspan="2" border="0" height="2"></td></tr>'
+            inner = (
+                '<table border="0" cellspacing="0" cellpadding="0">'
+                + spacer.join(rows)
+                + "</table>"
+            )
+            return f'<td border="0" cellpadding="0">{inner}</td>'
+
+        def node_port(name: str, port_str: str) -> str:
+            """Graphviz node:port for a connector, resolving attached connectors."""
+            return attached_ports.get(name, f"{name}{port_str}")
 
         for connector in self.connectors.values():
+            if connector.attach:
+                continue  # drawn inside the pin row of its host connector
             # If no wires connected (except maybe loop wires)?
             if not (connector.ports_left or connector.ports_right):
                 connector.ports_left = True  # Use left side pins.
@@ -196,7 +505,8 @@ class Harness:
                         if connector.show_name else None],
                     [pn_info_string(HEADER_PN, None, remove_links(connector.pn)),
                      html_line_breaks(pn_info_string(HEADER_MPN, connector.manufacturer, connector.mpn)),
-                     html_line_breaks(pn_info_string(HEADER_SPN, connector.supplier, connector.spn))],
+                     html_line_breaks(pn_info_string(HEADER_SPN, connector.supplier, connector.spn))
+                        if self.options.show_supplier_in_diagram else None],
                     [html_line_breaks(connector.type),
                      html_line_breaks(connector.subtype),
                      f'{connector.pincount}-pin' if connector.show_pincount else None,
@@ -209,14 +519,17 @@ class Harness:
 
             rows.extend(get_additional_component_table(self, connector))
             rows.append([html_line_breaks(connector.notes)])
-            html.extend(nested_html_table(rows, html_bgcolor_attr(connector.bgcolor)))
+            attach_left = any(
+                host == connector.name and side == "l" for host, _, side in attachments
+            )
+            attach_right = any(
+                host == connector.name and side == "r" for host, _, side in attachments
+            )
+            attached_to = attach_left or attach_right
 
+            # one list of cells per visible pin
+            pin_rows = []
             if connector.style != "simple":
-                pinhtml = []
-                pinhtml.append(
-                    '<table border="0" cellspacing="0" cellpadding="3" cellborder="1">'
-                )
-
                 for pinindex, (pinname, pinlabel, pincolor) in enumerate(
                     zip_longest(
                         connector.pins, connector.pinlabels, connector.pincolors
@@ -228,45 +541,97 @@ class Harness:
                     ):
                         continue
 
-                    pinhtml.append("   <tr>")
+                    cells = []
                     if connector.ports_left:
-                        pinhtml.append(f'    <td port="p{pinindex+1}l">{pinname}</td>')
+                        cells.append(f'<td port="p{pinindex+1}l">{pinname}</td>')
                     if pinlabel:
-                        pinhtml.append(f"    <td>{pinlabel}</td>")
+                        cells.append(f"<td>{pinlabel}</td>")
+                    elif attached_to and connector.pinlabels:
+                        cells.append("<td></td>")  # keep columns aligned
                     if connector.pincolors:
                         if pincolor in wv_colors._color_hex.keys():
                             # fmt: off
-                            pinhtml.append(f'    <td sides="tbl">{translate_color(pincolor, self.options.color_mode)}</td>')
-                            pinhtml.append( '    <td sides="tbr">')
-                            pinhtml.append( '     <table border="0" cellborder="1"><tr>')
-                            pinhtml.append(f'      <td bgcolor="{wv_colors.translate_color(pincolor, "HEX")}" width="8" height="8" fixedsize="true"></td>')
-                            pinhtml.append( '     </tr></table>')
-                            pinhtml.append( '    </td>')
+                            cells.append(f'<td sides="tbl">{translate_color(pincolor, self.options.color_mode)}</td>')
+                            cells.append( '<td sides="tbr">'
+                                          '<table border="0" cellborder="1"><tr>'
+                                         f'<td bgcolor="{wv_colors.translate_color(pincolor, "HEX")}" width="8" height="8" fixedsize="true"></td>'
+                                          '</tr></table>'
+                                          '</td>')
                             # fmt: on
                         else:
-                            pinhtml.append('    <td colspan="2"></td>')
-
+                            cells.append('<td colspan="2"></td>')
                     if connector.ports_right:
-                        pinhtml.append(f'    <td port="p{pinindex+1}r">{pinname}</td>')
-                    pinhtml.append("   </tr>")
+                        cells.append(f'<td port="p{pinindex+1}r">{pinname}</td>')
+                    pin_rows.append((pinindex, cells))
 
-                pinhtml.append("  </table>")
+            if not attached_to:
+                html.extend(
+                    nested_html_table(rows, html_bgcolor_attr(connector.bgcolor))
+                )
+                if connector.style != "simple":
+                    pinhtml = [
+                        '<table border="0" cellspacing="0" cellpadding="3" cellborder="1">'
+                    ]
+                    for _, cells in pin_rows:
+                        pinhtml.append("   <tr>")
+                        pinhtml.extend(f"    {cell}" for cell in cells)
+                        pinhtml.append("   </tr>")
+                    pinhtml.append("  </table>")
 
-                if len(pinhtml) == 2:  # Table start and end with no rows between?
-                    pinhtml = ["<!-- all pins hidden -->"]  # Avoid Graphviz error
+                    if len(pinhtml) == 2:  # Table start and end with no rows between?
+                        pinhtml = ["<!-- all pins hidden -->"]  # Avoid Graphviz error
 
-                html = [
-                    row.replace("<!-- connector table -->", "\n".join(pinhtml))
-                    for row in html
-                ]
+                    html = [
+                        row.replace("<!-- connector table -->", "\n".join(pinhtml))
+                        for row in html
+                    ]
+            else:
+                # Pin rows go directly into the outer table, with the attached
+                # connectors in extra columns left/right of the part's outline.
+                ncols = (
+                    int(connector.ports_left)
+                    + int(bool(connector.pinlabels))
+                    + 2 * int(bool(connector.pincolors))
+                    + int(connector.ports_right)
+                )
+                empty = '<td border="0"></td>'
+                left = empty if attach_left else ""
+                right = empty if attach_right else ""
+                html.append(
+                    '<table border="0" cellspacing="0" cellpadding="3" cellborder="1"'
+                    f"{html_bgcolor_attr(connector.bgcolor)}>"
+                )
+                for row in rows:
+                    if row == "<!-- connector table -->":
+                        for pinindex, cells in pin_rows:
+                            html.append(" <tr>")
+                            if attach_left:
+                                html.append(
+                                    f"  {attachment_cell(connector.name, pinindex, 'l')}"
+                                )
+                            html.extend(f"  {cell}" for cell in cells)
+                            if attach_right:
+                                html.append(
+                                    f"  {attachment_cell(connector.name, pinindex, 'r')}"
+                                )
+                            html.append(" </tr>")
+                    elif row is not None and (not isinstance(row, list) or any(row)):
+                        inner = "\n".join(nested_html_table([row]))
+                        html.append(
+                            f' <tr>{left}<td colspan="{ncols}" border="0" cellpadding="0">'
+                            f"{inner}</td>{right}</tr>"
+                        )
+                html.append("</table>")
 
             html = "\n".join(html)
             dot.node(
                 connector.name,
                 label=f"<\n{html}\n>",
-                shape="box",
+                # with attachments, the outline is drawn by the cell borders only
+                shape="none" if attached_to else "box",
                 style="filled",
                 fillcolor=translate_color(self.options.bgcolor_connector, "HEX"),
+                **self.buy_link(connector.name, connector.spn),
             )
 
             if len(connector.loops) > 0:
@@ -317,7 +682,8 @@ class Harness:
                         cable.mpn if not isinstance(cable.mpn, list) else None)),
                      html_line_breaks(pn_info_string(HEADER_SPN,
                         cable.supplier if not isinstance(cable.supplier, list) else None,
-                        cable.spn if not isinstance(cable.spn, list) else None))],
+                        cable.spn if not isinstance(cable.spn, list) else None))
+                        if self.options.show_supplier_in_diagram else None],
                     [html_line_breaks(cable.type),
                      f'{cable.wirecount}x' if cable.show_wirecount else None,
                      f'{cable.gauge} {cable.gauge_unit}{awg_fmt}' if cable.gauge else None,
@@ -365,10 +731,10 @@ class Harness:
                 # fmt: off
                 bgcolors = ['#000000'] + get_color_hex(connection_color, pad=pad) + ['#000000']
                 wirehtml.append(f"   <tr>")
-                wirehtml.append(f'    <td colspan="3" border="0" cellspacing="0" cellpadding="0" port="w{i}" height="{(2 * len(bgcolors))}">')
+                wirehtml.append(f'    <td colspan="3" border="0" cellspacing="0" cellpadding="0" port="w{i}" height="{(bar * len(bgcolors))}">')
                 wirehtml.append('     <table cellspacing="0" cellborder="0" border="0">')
                 for j, bgcolor in enumerate(bgcolors[::-1]):  # Reverse to match the curved wires when more than 2 colors
-                    wirehtml.append(f'      <tr><td colspan="3" cellpadding="0" height="2" bgcolor="{bgcolor if bgcolor != "" else wv_colors.default_color}" border="0"></td></tr>')
+                    wirehtml.append(f'      <tr><td colspan="3" cellpadding="0" height="{bar}" bgcolor="{bgcolor if bgcolor != "" else wv_colors.default_color}" border="0"></td></tr>')
                 wirehtml.append("     </table>")
                 wirehtml.append("    </td>")
                 wirehtml.append("   </tr>")
@@ -404,7 +770,7 @@ class Harness:
                     )
                     if manufacturer_info:
                         wireidentification.append(html_line_breaks(manufacturer_info))
-                    if supplier_info:
+                    if supplier_info and self.options.show_supplier_in_diagram:
                         wireidentification.append(html_line_breaks(supplier_info))
                     # print parameters into a table row under the wire
                     if len(wireidentification) > 0:
@@ -444,6 +810,8 @@ class Harness:
                 row.replace("<!-- wire table -->", "\n".join(wirehtml)) for row in html
             ]
 
+            edge_weight = {"weight": str(cable.weight)} if cable.weight else {}
+
             # connections
             for connection in cable.connections:
                 if isinstance(connection.via_port, int):
@@ -476,9 +844,9 @@ class Harness:
                         if from_connector.style != "simple"
                         else ""
                     )
-                    code_left_1 = f"{connection.from_name}{from_port_str}:e"
+                    code_left_1 = f"{node_port(connection.from_name, from_port_str)}:e"
                     code_left_2 = f"{cable.name}:w{connection.via_port}:w"
-                    dot.edge(code_left_1, code_left_2)
+                    dot.edge(code_left_1, code_left_2, **edge_weight)
                     if from_connector.show_name:
                         from_info = [
                             str(connection.from_name),
@@ -502,8 +870,8 @@ class Harness:
                         f":p{to_pin_index+1}l" if to_connector.style != "simple" else ""
                     )
                     code_right_1 = f"{cable.name}:w{connection.via_port}:e"
-                    code_right_2 = f"{connection.to_name}{to_port_str}:w"
-                    dot.edge(code_right_1, code_right_2)
+                    code_right_2 = f"{node_port(connection.to_name, to_port_str)}:w"
+                    dot.edge(code_right_1, code_right_2, **edge_weight)
                     if to_connector.show_name:
                         to_info = [str(connection.to_name), str(connection.to_pin)]
                         if to_connector.pinlabels:
@@ -530,10 +898,13 @@ class Harness:
                 shape="box",
                 style=style,
                 fillcolor=translate_color(bgcolor, "HEX"),
+                **self.buy_link(cable.name, cable.spn),
             )
 
         # mates
         for mate in self.mates:
+            if mate.from_name in attached_ports or mate.to_name in attached_ports:
+                continue  # drawn as attachment, see above
             if mate.shape[-1] == ">":
                 dir = "both" if mate.shape[0] == "<" else "forward"
             else:
@@ -635,6 +1006,161 @@ class Harness:
 
         return dot
 
+    def buy_link(self, designator: str, spn: Any) -> dict:
+        """
+        Node attributes making a diagram node clickable, when its supplier part
+        number (or that of an additional BOM item listing it) is a URL.
+        """
+        urls = [spn] + [
+            item.get("spn")
+            for item in self.additional_bom_items
+            if designator in (item.get("designators") or [])
+        ]
+        for url in urls:
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return {"URL": url, "target": "_blank", "tooltip": f"Buy {designator}"}
+        return {}
+
+    def bom_graph(self) -> Graph:
+        """The BOM as a single table node, with clickable supplier links."""
+        from html import escape
+
+        rows = bom_list(self.bom())
+        header, entries = rows[0], rows[1:]
+        title = escape(str(self.metadata.get("title", "")))
+        font = f'face="{self.options.fontname}"'
+        html = ['<table border="0" cellborder="1" cellspacing="0" cellpadding="4">']
+        html.append(
+            f'<tr><td colspan="{len(header)}" border="0" align="left">'
+            f'<font {font} point-size="16"><b>{title}</b> – Bill of Materials</font></td></tr>'
+        )
+        html.append(
+            "<tr>"
+            + "".join(f'<td bgcolor="#eeeeee"><b>{escape(h)}</b></td>' for h in header)
+            + "</tr>"
+        )
+        spn_col = header.index(HEADER_SPN) if HEADER_SPN in header else None
+        nodes = set(self.connectors) | set(self.cables)
+
+        def designator_links(value: str) -> str:
+            # each designator links to its node in the diagram (see output_pdf)
+            parts = [
+                f'<td href="#wireviz-node:{escape(d)}" border="0" cellpadding="0">'
+                f'<font color="#0645ad"><u>{escape(d)}</u></font></td>'
+                if d in nodes
+                else f'<td border="0" cellpadding="0">{escape(d)}</td>'
+                for d in value.split(", ")
+            ]
+            sep = '<td border="0" cellpadding="0">, </td>'
+            return (
+                '<td align="left"><table border="0" cellspacing="0" cellpadding="0"><tr>'
+                + sep.join(parts)
+                + "</tr></table></td>"
+            )
+        for entry in entries:
+            url = entry[spn_col] if spn_col is not None else ""
+            is_url = url.startswith(("http://", "https://"))
+            cells = []
+            for i, value in enumerate(entry):
+                text = escape(value)
+                if is_url and i == spn_col:
+                    cells.append(
+                        f'<td align="left" href="{escape(url)}" target="_blank">'
+                        f'<font color="#0645ad"><u>{text}</u></font></td>'
+                    )
+                elif is_url and header[i] == "Description":
+                    cells.append(
+                        f'<td align="left" href="{escape(url)}" target="_blank">'
+                        f'<font color="#0645ad">{text}</font></td>'
+                    )
+                elif header[i] == "Designators" and value:
+                    cells.append(designator_links(value))
+                else:
+                    cells.append(f'<td align="left">{text}</td>')
+            html.append("<tr>" + "".join(cells) + "</tr>")
+        html.append("</table>")
+        bom = Graph()
+        bom.attr("graph", fontname=self.options.fontname, margin="0.5")
+        bom.attr("node", shape="none", fontname=self.options.fontname)
+        bom.node("BOM", label="<" + "".join(html) + ">")
+        return bom
+
+    def output_pdf(self, filename: (str, Path), source, render_kwargs: dict) -> None:
+        """PDF with the diagram on the first page and the BOM on the second."""
+        from pypdf import PdfWriter
+
+        diagram = source.render(
+            filename=f"{filename}.diagram.tmp", format="pdf", cleanup=True, **render_kwargs
+        )
+        bom = self.bom_graph().render(
+            filename=f"{filename}.bom.tmp", format="pdf", cleanup=True
+        )
+        writer = PdfWriter()
+        for part in (diagram, bom):
+            writer.append(part)
+        self.link_designators(writer, source, render_kwargs)
+        writer.add_metadata({"/Title": str(self.metadata.get("title", ""))})
+        with open(f"{filename}.pdf", "wb") as f:
+            writer.write(f)
+        for part in (diagram, bom):
+            Path(part).unlink()
+
+    def link_designators(self, writer, source, render_kwargs: dict) -> None:
+        """
+        Turn the `#wireviz-node:<designator>` links of the BOM page into links
+        that jump to the diagram page, zoomed to that node.
+        """
+        import json
+
+        from pypdf.generic import (
+            ArrayObject,
+            DictionaryObject,
+            FloatObject,
+            NameObject,
+        )
+
+        layout = json.loads(source.pipe(format="json", **render_kwargs))
+        bb = [float(v) for v in layout["bb"].split(",")]
+        diagram = writer.pages[0]
+        box = diagram.mediabox
+        # Graphviz centers the drawing on the page with a margin
+        pad_x = (float(box.width) - (bb[2] - bb[0])) / 2 + float(box.left)
+        pad_y = (float(box.height) - (bb[3] - bb[1])) / 2 + float(box.bottom)
+        rects = {}
+        for obj in layout.get("objects", []):
+            if "pos" not in obj or "width" not in obj:
+                continue
+            x, y = (float(v) for v in obj["pos"].split(","))
+            w, h = float(obj["width"]) * 72, float(obj["height"]) * 72
+            margin = 36  # some space around the node when zoomed in
+            rects[obj["name"]] = [
+                x - w / 2 - bb[0] + pad_x - margin,
+                y - h / 2 - bb[1] + pad_y - margin,
+                x + w / 2 - bb[0] + pad_x + margin,
+                y + h / 2 - bb[1] + pad_y + margin,
+            ]
+
+        for page in writer.pages[1:]:
+            for annot in page.get("/Annots", []):
+                annot = annot.get_object()
+                action = annot.get("/A")
+                uri = action.get_object().get("/URI") if action else None
+                if not uri or not str(uri).startswith("#wireviz-node:"):
+                    continue
+                rect = rects.get(str(uri).split(":", 1)[1])
+                if rect is None:
+                    continue
+                destination = ArrayObject(
+                    [diagram.indirect_reference, NameObject("/FitR")]
+                    + [FloatObject(v) for v in rect]
+                )
+                annot[NameObject("/A")] = DictionaryObject(
+                    {
+                        NameObject("/S"): NameObject("/GoTo"),
+                        NameObject("/D"): destination,
+                    }
+                )
+
     # cache for the GraphViz Graph object
     # do not access directly, use self.graph instead
     _graph = None
@@ -645,20 +1171,37 @@ class Harness:
             self._graph = self.create_graph()
         return self._graph  # return cached graph
 
+    def render_source(self):
+        """
+        Return the object to render (graph or laid-out source) and the extra
+        render arguments. With options.smooth_wires, dot only places the nodes;
+        every edge is then replaced by a single cubic Bezier curve with
+        horizontal tangents, and neato renders the result without re-layout.
+        """
+        if not self.options.smooth_wires:
+            return self.graph, {}
+        layout = self.graph.pipe(format="dot", encoding="utf-8")
+        return (
+            Source(smooth_edges(layout, self.options.wire_width), engine="neato"),
+            {"neato_no_op": 2},
+        )
+
     @property
     def png(self):
         from io import BytesIO
 
-        graph = self.graph
+        source, kwargs = self.render_source()
         data = BytesIO()
-        data.write(graph.pipe(format="png"))
+        data.write(source.pipe(format="png", **kwargs))
         data.seek(0)
         return data.read()
 
     @property
     def svg(self):  # TODO?: Verify xml encoding="utf-8" in SVG?
-        graph = self.graph
-        return embed_svg_images(graph.pipe(format="svg").decode("utf-8"), Path.cwd())
+        source, kwargs = self.render_source()
+        return embed_svg_images(
+            source.pipe(format="svg", **kwargs).decode("utf-8"), Path.cwd()
+        )
 
     def output(
         self,
@@ -669,6 +1212,7 @@ class Harness:
     ) -> None:
         # graphical output
         graph = self.graph
+        source, render_kwargs = self.render_source()
         svg_already_exists = Path(
             f"{filename}.svg"
         ).exists()  # if SVG already exists, do not delete later
@@ -680,8 +1224,13 @@ class Harness:
                 # SVG file will be renamed/deleted later
                 _filename = f"{filename}.tmp" if f == "svg" else filename
                 # TODO: prevent rendering SVG twice when both SVG and HTML are specified
-                graph.format = f
-                graph.render(filename=_filename, view=view, cleanup=cleanup)
+                source.render(
+                    filename=_filename,
+                    format=f,
+                    view=view,
+                    cleanup=cleanup,
+                    **render_kwargs,
+                )
         # embed images into SVG output
         if "svg" in fmt or "html" in fmt:
             embed_svg_images_file(f"{filename}.tmp.svg")
@@ -700,8 +1249,7 @@ class Harness:
             generate_html_output(filename, bomlist, self.metadata, self.options)
         # PDF output
         if "pdf" in fmt:
-            # TODO: implement PDF output
-            print("PDF output is not yet supported")
+            self.output_pdf(filename, source, render_kwargs)
         # delete SVG if not needed
         if "html" in fmt and not "svg" in fmt:
             # SVG file was just needed to generate HTML

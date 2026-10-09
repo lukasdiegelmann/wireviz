@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from wireviz.DataClasses import AdditionalComponent, Cable, Color, Connector
 from wireviz.wv_colors import translate_color
 from wireviz.wv_gv_html import html_bgcolor_attr, html_line_breaks
-from wireviz.wv_helper import clean_whitespace
+from wireviz.wv_helper import awg_equiv, clean_whitespace, mm2_equiv
 
 BOM_COLUMNS_ALWAYS = ("id", "description", "qty", "unit", "designators")
 BOM_COLUMNS_OPTIONAL = ("pn", "manufacturer", "mpn", "supplier", "spn")
@@ -125,6 +125,16 @@ def generate_bom(harness: "Harness") -> List[BOMEntry]:
         # add connectors aditional components to bom
         bom_entries.extend(get_additional_component_bom(connector))
 
+    def gauge_str(cable: Cable) -> str:
+        """Gauge as in the diagram, incl. the AWG/mm² equivalent if show_equiv."""
+        equiv = ""
+        if cable.show_equiv:
+            if cable.gauge_unit == "mm\u00B2":
+                equiv = f" ({awg_equiv(cable.gauge)} AWG)"
+            elif cable.gauge_unit.upper() == "AWG":
+                equiv = f" ({mm2_equiv(cable.gauge)} mm\u00B2)"
+        return f"{cable.gauge} {cable.gauge_unit}{equiv}"
+
     # cables
     # TODO: If category can have other non-empty values than 'bundle', maybe it should be part of description?
     for cable in harness.cables.values():
@@ -136,7 +146,7 @@ def generate_bom(harness: "Harness") -> List[BOMEntry]:
                     + (f", {cable.type}" if cable.type else "")
                     + (f", {cable.wirecount}")
                     + (
-                        f" x {cable.gauge} {cable.gauge_unit}"
+                        f" x {gauge_str(cable)}"
                         if cable.gauge
                         else " wires"
                     )
@@ -162,7 +172,7 @@ def generate_bom(harness: "Harness") -> List[BOMEntry]:
                     description = (
                         "Wire"
                         + (f", {cable.type}" if cable.type else "")
-                        + (f", {cable.gauge} {cable.gauge_unit}" if cable.gauge else "")
+                        + (f", {gauge_str(cable)}" if cable.gauge else "")
                         + (
                             f", {translate_color(color, harness.options.color_mode)}"
                             if color

@@ -58,6 +58,11 @@ class Options:
     color_mode: ColorMode = "SHORT"
     mini_bom_mode: bool = True
     template_separator: str = "."
+    ranksep: float = 2  # horizontal distance between columns (inches)
+    nodesep: float = 0.33  # vertical distance between nodes in a column (inches)
+    show_supplier_in_diagram: bool = True  # False: supplier/SPN only in the BOM
+    smooth_wires: bool = False  # redraw each wire as one smooth S-curve
+    wire_width: float = 2  # width of each color stripe of a wire (points)
 
     def __post_init__(self):
         if not self.bgcolor_node:
@@ -163,10 +168,16 @@ class Connector:
     loops: List[List[Pin]] = field(default_factory=list)
     ignore_in_bom: bool = False
     additional_components: List[AdditionalComponent] = field(default_factory=list)
+    # draw this (simple) connector attached to the pin it is mated with,
+    # instead of as a separate node, e.g. for crimp contacts or solder joints
+    attach: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.image, dict):
             self.image = Image(**self.image)
+
+        if self.attach and self.style != "simple":
+            raise Exception("Only connectors with style set to simple can be attached")
 
         self.ports_left = False
         self.ports_right = False
@@ -272,6 +283,9 @@ class Cable:
     show_wirenumbers: Optional[bool] = None
     ignore_in_bom: bool = False
     additional_components: List[AdditionalComponent] = field(default_factory=list)
+    # Graphviz edge weight: higher values keep the wires straight and short,
+    # e.g. to keep a main chain on one row
+    weight: Optional[int] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.image, dict):
